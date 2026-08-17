@@ -240,8 +240,11 @@ pub fn get_variable_info(
                     let child_symbol = step.symbol();
                     let child_type = step.child_type(default_aliases);
 
-                    let child_is_hidden = !child_type_is_visible(&child_type)
-                        && !syntax_grammar.supertype_symbols.contains(&child_symbol);
+                    let is_supertype_and_not_inlined = syntax_grammar
+                        .supertype_symbols
+                        .contains(&child_symbol)
+                        && !syntax_grammar.variables_to_inline.contains(&child_symbol);
+                    let child_is_hidden = !child_type_is_visible(&child_type) && !is_supertype_and_not_inlined;
 
                     // Maintain the set of all child types for this variable, and the quantity of
                     // visible children in this production.
@@ -617,7 +620,15 @@ pub fn generate_node_types_json(
     for (i, info) in variable_info.iter().enumerate() {
         let symbol = Symbol::non_terminal(i);
         let variable = &syntax_grammar.variables[i];
-        if syntax_grammar.supertype_symbols.contains(&symbol) {
+        let is_supertype = syntax_grammar.supertype_symbols.contains(&symbol);
+        let is_inline = syntax_grammar.variables_to_inline.contains(&symbol);
+        if is_supertype && is_inline {
+            log::warn!(
+                "Symbol `{}` is both a supertype and inlined; omitting it from \
+                node-types.json since it can never appear in the parsed tree",
+                str_pool.resolve(variable.name)
+            );
+        } else if is_supertype {
             let node_type_json =
                 node_types_json
                     .entry(variable.name)
@@ -650,7 +661,7 @@ pub fn generate_node_types_json(
                 subtype_map.push((supertype, subtypes.clone()));
             }
             node_type_json.subtypes = Some(subtypes);
-        } else if !syntax_grammar.variables_to_inline.contains(&symbol) {
+        } else if !is_inline {
             // If a rule is aliased under multiple names, then its information
             // contributes to multiple entries in the final JSON.
             for alias in aliases_by_symbol.get(&symbol).unwrap_or(&BTreeSet::new()) {
@@ -875,11 +886,11 @@ fn variable_type_for_child_type(
     match child_type {
         ChildType::Aliased(alias) => alias.kind(),
         ChildType::Normal(symbol) => {
-            if syntax_grammar.supertype_symbols.contains(symbol) {
-                VariableType::Named
-            } else if syntax_grammar.variables_to_inline.contains(symbol) {
-                VariableType::Hidden
-            } else {
+        if syntax_grammar.supertype_symbols.contains(symbol) && !syntax_grammar.variables_to_inline.contains(symbol) {
+            VariableType::Named
+        } else if syntax_grammar.variables_to_inline.contains(symbol) {
+            VariableType::Hidden
+        } else {
                 let symbol_index = symbol.index as usize;
                 match symbol.kind {
                     SymbolType::NonTerminal => syntax_grammar.variables[symbol_index].kind,
@@ -1365,6 +1376,79 @@ mod tests {
                     .into_iter()
                     .collect()
                 )
+            }
+        );
+    }
+
+    #[test]
+    fn test_node_types_with_inlined_supertypes() {
+        // A symbol that is both a supertype and inlined can never actually
+        // appear as a node in the parsed tree, since being inlined erases it.
+        // It should not get its own entry in node-types.json, and anything
+        // that references it should show its children instead (the same
+        // flattening that happens for any other inlined rule).
+        let mut pool = RulePool::default();
+        let v1 = named(&mut pool, "v2");
+        let v2 = {
+            let (a, b) = (named(&mut pool, "v3"), named(&mut pool, "v4"));
+            pool.choice(&[a, b])
+        };
+        let v3 = string(&mut pool, "a");
+        let v4 = string(&mut pool, "b");
+        let node_types = get_node_types(InputGrammar {
+            supertype_names: vec![pool.intern("v2")],
+            inline_names: vec![pool.intern("v2")],
+            variables: vec![
+                Variable {
+                    name: pool.intern("v1"),
+                    root: v1,
+                },
+                // v2 should not appear in the node types at all, since it is
+                // both a supertype and inlined.
+                Variable {
+                    name: pool.intern("v2"),
+                    root: v2,
+                },
+                Variable {
+                    name: pool.intern("v3"),
+                    root: v3,
+                },
+                Variable {
+                    name: pool.intern("v4"),
+                    root: v4,
+                },
+            ],
+            pool,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(node_types.len(), 3);
+        assert!(node_types.iter().all(|n| n.kind != "v2"));
+
+        assert_eq!(
+            node_types[0],
+            NodeInfoJSON {
+                kind: "v1".to_string(),
+                named: true,
+                root: true,
+                extra: false,
+                subtypes: None,
+                fields: Some(BTreeMap::new()),
+                children: Some(FieldInfoJSON {
+                    multiple: false,
+                    required: true,
+                    types: vec![
+                        NodeTypeJSON {
+                            kind: "v3".to_string(),
+                            named: true,
+                        },
+                        NodeTypeJSON {
+                            kind: "v4".to_string(),
+                            named: true,
+                        },
+                    ]
+                }),
             }
         );
     }
